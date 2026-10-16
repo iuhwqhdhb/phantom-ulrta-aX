@@ -1,0 +1,107 @@
+name: Build Phantom Demo IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify web assets are present
+        run: |
+          test -f www/index.html || { echo "::error::www/index.html missing - commit the www folder first"; exit 1; }
+          ls -la www
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Scaffold Capacitor project
+        run: |
+          npm init -y
+          npm i @capacitor/core@6 @capacitor/cli@6 @capacitor/ios@6 @capacitor/haptics@6 @capacitor/local-notifications@6
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.demo.phantom122",
+            "appName": "Phantom Demo",
+            "webDir": "www",
+            "server": { "iosScheme": "app" },
+            "ios": { "contentInset": "never" }
+          }
+          EOF
+          npx cap add ios
+          npx cap sync ios
+
+      - name: Apply supplied app icon to iOS project
+        run: |
+          python3 - <<'PY'
+          import json
+          import shutil
+          from pathlib import Path
+
+          appicons = list(Path('ios').rglob('AppIcon.appiconset'))
+          if len(appicons) != 1:
+              raise SystemExit(f'Expected one iOS AppIcon.appiconset, found {len(appicons)}')
+          target = appicons[0]
+          shutil.copyfile('www/icon-1024.png', target / 'AppIcon-1024.png')
+          contents = {
+              'images': [{'filename': 'AppIcon-1024.png', 'idiom': 'universal', 'platform': 'ios', 'size': '1024x1024'}],
+              'info': {'author': 'xcode', 'version': 1},
+          }
+          (target / 'Contents.json').write_text(json.dumps(contents, indent=2) + '\n')
+          PY
+
+      - name: Lock orientation to portrait
+        run: |
+          PLIST=ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations array" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationPortrait" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations~ipad" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad array" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad:0 string UIInterfaceOrientationPortrait" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print" "$PLIST"
+
+      - name: Build unsigned archive
+        run: |
+          cd ios/App
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Package into Phantom Demo.ipa
+        run: |
+          APP=$(find ios/App/build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "app bundle: $APP"
+          test -n "$APP" || { echo "::error::no .app produced"; exit 1; }
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry "Phantom Demo.ipa" Payload
+          ls -la "Phantom Demo.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Phantom-Demo-IPA
+          path: Phantom Demo.ipa
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-147
+          name: Phantom Demo
+          files: Phantom Demo.ipa
